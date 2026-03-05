@@ -1,0 +1,10 @@
+# Claude Code directory (contains user-specific settings and permission cache)
+.claude/
+
+# Environment files
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
