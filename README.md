@@ -29,7 +29,7 @@ Turn epic checklists into an automated queue: assign issues sequentially, auto-m
 
 I typically brainstorm features with Claude or Copilot locally, create an implementation plan, then convert it into GitHub issues organized in an epic. Previously, I'd manually assign tickets to Copilot one-by-one, review each PR, and merge before moving to the next. This script automates that entire flow — letting you run it in the background while Copilot works through your checklist.
 
-**Real-world use cases:**
+**Some work i managed to automate using this queue:**
 
 - **Large migrations** — Migrated 80+ Lambda functions to a single Express.js app
 - **Component library swaps** — Converted entire codebase from Material-UI to Tailwind
