@@ -148,11 +148,13 @@ epic_unchecked_issue_numbers() {
   local body
   body="$(gh issue view -R "$REPO" "$epic" --json body -q .body)"
 
-  # Extract unchecked checklist items only:
+  # Extract unchecked checklist items with flexible format support:
   #   - [ ] #212 — Title
-  # Capture the issue number after '#'.
+  #   - [ ] Title (#212)
+  #   - [ ] Title #212
+  # Capture the issue number wherever it appears after '#' in the line.
   # BSD awk on macOS doesn't support `match(..., ..., array)`; use sed instead.
-  echo "$body" | sed -nE 's/^- \[ \] #([0-9]+).*/\1/p'
+  echo "$body" | sed -nE 's/^- \[ \] .*#([0-9]+).*/\1/p'
 }
 
 epic_all_issue_numbers() {
@@ -160,10 +162,13 @@ epic_all_issue_numbers() {
   local body
   body="$(gh issue view -R "$REPO" "$epic" --json body -q .body)"
 
-  # Match both checked and unchecked checklist items:
+  # Match both checked and unchecked checklist items with flexible format support:
   #   - [ ] #212 — Title
   #   - [x] #212 — Title
-  echo "$body" | sed -nE 's/^- \[[ xX]\] #([0-9]+).*/\1/p'
+  #   - [ ] Title (#212)
+  #   - [x] Title (#212)
+  # Capture the issue number wherever it appears after '#' in the line.
+  echo "$body" | sed -nE 's/^- \[[ xX]\] .*#([0-9]+).*/\1/p'
 }
 
 issue_state_json() {
@@ -184,7 +189,7 @@ find_inflight_issue() {
     while read -r issue; do
       [[ -z "$issue" ]] && continue
       local state
-      state="$(gh issue view -R "$REPO" "$issue" --json state -q .state)"
+      state="$(gh issue view -R "$REPO" "$issue" --json state -q .state 2>/dev/null || true)"
       if [[ "$state" != "OPEN" ]]; then
         continue
       fi
@@ -500,9 +505,9 @@ sync_epic_checklist() {
   local body
   body="$(gh issue view -R "$REPO" "$epic" --json body -q .body)"
 
-  # Collect unique issue numbers referenced in checklist.
+  # Collect unique issue numbers referenced in checklist (flexible format support).
   local issue_nums
-  issue_nums="$(sed -nE 's/^- \[[ xX]\] #([0-9]+).*/\1/p' <<<"$body" | sort -n | uniq)"
+  issue_nums="$(sed -nE 's/^- \[[ xX]\] .*#([0-9]+).*/\1/p' <<<"$body" | sort -n | uniq)"
   if [[ -z "${issue_nums:-}" ]]; then
     return 0
   fi
@@ -521,13 +526,15 @@ sync_epic_checklist() {
 
   local new_body
   new_body=""
-  local line num rest
+  local line num
   while IFS= read -r line; do
-    if [[ "$line" =~ ^-\ \[\ \]\ \#([0-9]+)\ (.*)$ ]]; then
+    # Check if line is an unchecked checklist item with an issue number
+    if [[ "$line" =~ ^-\ \[\ \]\ .*\#([0-9]+) ]]; then
       num="${BASH_REMATCH[1]}"
-      rest="${BASH_REMATCH[2]}"
+      # If this issue is closed, mark it as checked
       if grep -Eq "^${num}[[:space:]]+CLOSED$" <<<"$states_tsv"; then
-        new_body+="- [x] #$num $rest"$'\n'
+        # Replace - [ ] with - [x] at the start of the line
+        new_body+="${line/- \[ \]/- [x]}"$'\n'
       else
         new_body+="$line"$'\n'
       fi
@@ -630,7 +637,7 @@ main() {
       while read -r issue; do
         [[ -z "$issue" ]] && continue
         local state
-        state="$(gh issue view -R "$REPO" "$issue" --json state -q .state)"
+        state="$(gh issue view -R "$REPO" "$issue" --json state -q .state 2>/dev/null || true)"
         if [[ "$state" != "OPEN" ]]; then
           continue
         fi
