@@ -32,7 +32,57 @@ MIN_IDLE_SECONDS="120"
 SLEEP_HINT_SECONDS=""
 SYNC_EPICS="false"
 
-# Defaults for Copilot coding agent PR detection. Override for other agents/tools.
+# ── UI / progress-bar state ──────────────────────────────────────────────────
+TOTAL_ISSUES=0
+DONE_ISSUES=0
+CURRENT_ISSUE_NUM=""
+CURRENT_ISSUE_TITLE=""
+_PROGRESS_ACTIVE=false
+_UI_ENABLED=false
+[[ -t 1 ]] && _UI_ENABLED=true
+
+draw_progress() {
+  [[ "$_UI_ENABLED" == false ]] && return 0
+  local width=28 filled=0 pct=0
+  [[ "$TOTAL_ISSUES" -gt 0 ]] && filled=$(( DONE_ISSUES * width / TOTAL_ISSUES ))
+  [[ "$TOTAL_ISSUES" -gt 0 ]] && pct=$(( DONE_ISSUES * 100 / TOTAL_ISSUES ))
+  local bar="" i
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=filled; i<width; i++)); do bar+="░"; done
+  local label="[${bar}] ${DONE_ISSUES}/${TOTAL_ISSUES} (${pct}%)"
+  if [[ -n "$CURRENT_ISSUE_NUM" ]]; then
+    local suffix=" — #${CURRENT_ISSUE_NUM}"
+    [[ -n "$CURRENT_ISSUE_TITLE" ]] && suffix+=" ${CURRENT_ISSUE_TITLE}"
+    local cols; cols="$(tput cols 2>/dev/null || echo 80)"
+    local max_len=$(( cols - ${#label} - 1 ))
+    if [[ "${#suffix}" -gt "$max_len" && "$max_len" -gt 4 ]]; then
+      suffix="${suffix:0:$(( max_len - 1 ))}…"
+    fi
+    label+="$suffix"
+  fi
+  printf "\033[2K\033[1m%s\033[0m\n" "$label"
+  _PROGRESS_ACTIVE=true
+}
+
+_clear_progress() {
+  [[ "$_UI_ENABLED" == false || "$_PROGRESS_ACTIVE" == false ]] && return 0
+  printf "\033[1A\033[2K"
+  _PROGRESS_ACTIVE=false
+}
+
+log() {
+  _clear_progress
+  echo "[info] $*"
+  draw_progress
+}
+
+warn() {
+  _clear_progress
+  echo "[warn] $*"
+  draw_progress
+}
+
+# ── Defaults for Copilot coding agent PR detection. Override for other agents/tools.
 PR_AUTHOR="${QUEUE_PR_AUTHOR:-app/copilot-swe-agent}"
 PR_BRANCH_PREFIX="${QUEUE_PR_BRANCH_PREFIX:-copilot/}"
 
@@ -55,7 +105,7 @@ Common Options:
   --min-idle-seconds N        Only merge PRs idle for N seconds (default: 120)
   --watch                     Keep running in a poll loop
   --interval-seconds N        Poll interval when using --watch (default: 60)
-  --sync-epics                Auto-check [x] epic items when issues are closed
+  --sync-epics                Auto-check [x] epic items when issues are closed, and close the epic when all are done
 
 Advanced Options:
   --pr-author LOGIN           Filter PRs by author (default: app/copilot-swe-agent)
@@ -78,6 +128,7 @@ EOF
 }
 
 die() {
+  _clear_progress
   echo "[error] $*" >&2
   exit 1
 }
@@ -210,6 +261,22 @@ collect_all_epic_issue_numbers() {
   done < <(split_csv "$EPICS")
 }
 
+init_progress_counts() {
+  local epic total=0 done=0
+  while read -r epic; do
+    [[ -z "$epic" ]] && continue
+    local body
+    body="$(gh issue view -R "$REPO" "$epic" --json body -q .body 2>/dev/null || true)"
+    local t d
+    t=$(printf '%s\n' "$body" | sed -nE 's/^- \[[ xX]\] .*#([0-9]+).*/\1/p' | grep -c . || true)
+    d=$(printf '%s\n' "$body" | sed -nE 's/^- \[[xX]\] .*#([0-9]+).*/\1/p' | grep -c . || true)
+    total=$(( total + t ))
+    done=$(( done + d ))
+  done < <(split_csv "$EPICS")
+  TOTAL_ISSUES="$total"
+  DONE_ISSUES="$done"
+}
+
 list_open_prs_json() {
   gh pr list -R "$REPO" --state open --limit 200 --json number,title,body,author,headRefName,headRefOid,isDraft,mergeable,updatedAt
 }
@@ -279,15 +346,15 @@ merge_pr_via_api() {
   )
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] ${merge_cmd[*]}"
-    echo "[dry-run] gh api -X DELETE repos/$REPO/git/refs/heads/$head_ref"
+    log "[dry-run] ${merge_cmd[*]}"
+    log "[dry-run] gh api -X DELETE repos/$REPO/git/refs/heads/$head_ref"
     return 0
   fi
 
   # Merge the PR (non-interactive).
   # If branch protections block merge, this endpoint returns an error.
   if ! "${merge_cmd[@]}" >/dev/null; then
-    echo "[warn] Merge API call failed for PR #$pr."
+    warn "Merge API call failed for PR #$pr."
     return 1
   fi
 
@@ -317,7 +384,7 @@ automerge_agent_prs() {
   )"
 
   if [[ -z "$pr_lines" ]]; then
-    echo "[info] No eligible PRs to merge."
+    log "No eligible PRs to merge."
     return 0
   fi
 
@@ -343,13 +410,16 @@ automerge_agent_prs() {
 
         local ready_cmd=(gh pr ready -R "$REPO" "$pr")
         if [[ "$DRY_RUN" == "true" ]]; then
-          echo "[dry-run] ${ready_cmd[*]}"
+          log "[dry-run] ${ready_cmd[*]}"
         else
-          echo "[info] Marking PR #$pr ready for review ..."
+          log "Marking PR #$pr ready for review ..."
+          _clear_progress
           "${ready_cmd[@]}" || {
-            echo "[warn] Failed to mark PR #$pr ready."
+            draw_progress
+            warn "Failed to mark PR #$pr ready."
             continue
           }
+          draw_progress
         fi
 
         # We've already waited the full idle window before flipping draft→ready.
@@ -394,7 +464,7 @@ automerge_agent_prs() {
 
   if [[ "${#waiting_msgs[@]}" -gt 0 ]]; then
     for msg in "${waiting_msgs[@]}"; do
-      echo "[info] $msg"
+      log "$msg"
     done
   fi
 
@@ -412,8 +482,8 @@ automerge_agent_prs() {
     return 0
   fi
 
-  echo "[info] Eligible PRs to merge:"
-  printf "%s\n" "${to_merge[@]}" | cut -f1 | sed 's/^/[info]  - #/'
+  log "Eligible PRs to merge:"
+  printf "%s\n" "${to_merge[@]}" | cut -f1 | while read -r _n; do log " - #$_n"; done
 
   local item
   for item in "${to_merge[@]}"; do
@@ -425,15 +495,23 @@ automerge_agent_prs() {
     if [[ "$AUTO_APPROVE" == "true" ]]; then
       local approve_cmd=(gh pr review -R "$REPO" "$pr" --approve)
       if [[ "$DRY_RUN" == "true" ]]; then
-        echo "[dry-run] ${approve_cmd[*]}"
+        log "[dry-run] ${approve_cmd[*]}"
       else
-        echo "[info] Approving PR #$pr ..."
-        "${approve_cmd[@]}" || echo "[warn] Failed to approve PR #$pr (may already be approved or not permitted)."
+        log "Approving PR #$pr ..."
+        _clear_progress
+        local _approve_ok=true
+        "${approve_cmd[@]}" || _approve_ok=false
+        draw_progress
+        [[ "$_approve_ok" == false ]] && warn "Failed to approve PR #$pr (may already be approved or not permitted)."
       fi
     fi
 
-    echo "[info] Merging PR #$pr ..."
-    merge_pr_via_api "$pr" "$head_ref" "$head_sha" || echo "[warn] Failed to merge PR #$pr. Leaving it open."
+    log "Merging PR #$pr ..."
+    if merge_pr_via_api "$pr" "$head_ref" "$head_sha"; then
+      DONE_ISSUES=$(( DONE_ISSUES + 1 ))
+    else
+      warn "Failed to merge PR #$pr. Leaving it open."
+    fi
   done
 }
 
@@ -493,9 +571,9 @@ assign_issue_to_assignee() {
     -F "assignees[]=$assignee_id"
   )
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] ${cmd[*]}"
+    log "[dry-run] ${cmd[*]}"
   else
-    echo "[info] Assigning #$issue to $ASSIGNEE ..."
+    log "Assigning #$issue to $ASSIGNEE ..."
     "${cmd[@]}"
   fi
 }
@@ -548,11 +626,11 @@ sync_epic_checklist() {
   fi
 
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] sync epic #$epic checklist (mark closed issues as [x])"
+    log "[dry-run] sync epic #$epic checklist (mark closed issues as [x])"
     return 0
   fi
 
-  echo "[info] Syncing epic #$epic checklist (mark closed issues as [x]) ..."
+  log "Syncing epic #$epic checklist (mark closed issues as [x]) ..."
   gh issue edit -R "$REPO" "$epic" --body-file - <<<"$new_body" >/dev/null
 }
 
@@ -561,6 +639,22 @@ sync_all_epics() {
   while read -r epic; do
     [[ -z "$epic" ]] && continue
     sync_epic_checklist "$epic"
+  done < <(split_csv "$EPICS")
+}
+
+close_all_epics() {
+  local epic
+  while read -r epic; do
+    [[ -z "$epic" ]] && continue
+    local state
+    state="$(gh issue view -R "$REPO" "$epic" --json state -q .state 2>/dev/null || true)"
+    [[ "$state" != "OPEN" ]] && continue
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[dry-run] gh issue close -R $REPO $epic"
+    else
+      log "Closing epic #$epic ..."
+      gh issue close -R "$REPO" "$epic" >/dev/null
+    fi
   done < <(split_csv "$EPICS")
 }
 
@@ -594,6 +688,9 @@ main() {
   issues_regex="$(echo "$issue_numbers" | awk '{for(i=1;i<=NF;i++) printf("%s%s", (i==1?"":"|"), $i)}')"
   issues_regex="#(${issues_regex})\\b"
 
+  init_progress_counts
+  draw_progress
+
   local last_inflight=""
 
   while :; do
@@ -609,11 +706,13 @@ main() {
       title="$(echo "$info" | jq -r .title)"
       url="$(echo "$info" | jq -r .url)"
 
+      CURRENT_ISSUE_NUM="$inflight"
+      CURRENT_ISSUE_TITLE="$title"
       if [[ "$WATCH" == "true" && "$inflight" == "$last_inflight" ]]; then
-        echo "[info] Waiting on $ASSIGNEE issue #$inflight (next check in ${INTERVAL_SECONDS}s)"
+        log "Waiting on $ASSIGNEE issue #$inflight (next check in ${INTERVAL_SECONDS}s)"
       else
-        echo "[info] $ASSIGNEE assigned to #$inflight: $title"
-        echo "[info] $url"
+        log "$ASSIGNEE assigned to #$inflight: $title"
+        log "$url"
       fi
       last_inflight="$inflight"
 
@@ -625,7 +724,7 @@ main() {
         sleep "$sleep_for"
         continue
       fi
-      echo "[info] Tip: pass --watch to keep polling until the issue is closed/merged."
+      log "Tip: pass --watch to keep polling until the issue is closed/merged."
       exit 0
     fi
 
@@ -648,8 +747,10 @@ main() {
         local title url
         title="$(echo "$info" | jq -r .title)"
         url="$(echo "$info" | jq -r .url)"
-        echo "[info] Assigned next issue: #$issue $title"
-        echo "[info] $url"
+        CURRENT_ISSUE_NUM="$issue"
+        CURRENT_ISSUE_TITLE="$title"
+        log "Assigned next issue: #$issue $title"
+        log "$url"
         last_inflight="$issue"
         assigned="true"
         break 2
@@ -668,12 +769,13 @@ main() {
       exit 0
     fi
 
-    echo "[info] No open unchecked issues remain in epics: $EPICS"
+    log "No open unchecked issues remain in epics: $EPICS"
     if [[ "$SYNC_EPICS" == "true" ]]; then
       sync_all_epics
+      close_all_epics
     else
-      echo "[info] Tip: pass --sync-epics to automatically check off epic items for closed issues."
-      echo "[info] If you still see open issues on GitHub, they may not be referenced in these epics."
+      log "Tip: pass --sync-epics to automatically check off completed items and close the epic."
+      log "If you still see open issues on GitHub, they may not be referenced in these epics."
     fi
     exit 0
   done
